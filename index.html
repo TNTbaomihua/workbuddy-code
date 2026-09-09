@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#FDF6EC" />
+  <meta name="format-detection" content="telephone=no,email=no,address=no" />
+  <title>咖窝子的日常记录</title>
+  <link rel="manifest" href="./manifest.json?v=18" />
+  <link rel="icon" type="image/png" href="./icon-192.png" />
+  <link rel="apple-touch-icon" href="./icon-180.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="咖窝子" />
+  <meta name="application-name" content="咖窝子" />
+  <link rel="stylesheet" href="./css/styles.css?v=18" />
+</head>
+<body>
+  <div id="app">
+    <!-- 顶部栏 -->
+    <header class="topbar" id="topbar">
+      <div class="topbar-inner">
+        <div class="tb-title" id="tb-title">咖窝子</div>
+        <div class="tb-actions">
+          <button class="icon-btn" id="btn-cal" title="日历" aria-label="日历"></button>
+          <button class="icon-btn" id="btn-setting-quick" title="设置" aria-label="设置"></button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 主内容 -->
+    <main class="main" id="main">
+      <!-- 首页 -->
+      <section class="view" id="view-home"><div class="loading">🌿 正在加载每日生活…</div></section>
+      <!-- 个人页 -->
+      <section class="view hidden" id="view-profile"></section>
+      <!-- 统计 -->
+      <section class="view hidden" id="view-stats"></section>
+      <!-- 设置 -->
+      <section class="view hidden" id="view-settings"></section>
+    </main>
+
+    <!-- 详情子视图（覆盖在 main 上） -->
+    <section class="detail-view hidden" id="detail-view">
+      <header class="detail-bar">
+        <button class="icon-btn" id="detail-back" aria-label="返回"></button>
+        <div class="detail-icon" id="detail-icon"></div>
+        <div class="detail-title" id="detail-title">详情</div>
+        <button class="icon-btn" id="detail-add" aria-label="新增"></button>
+      </header>
+      <div class="detail-body" id="detail-body"></div>
+    </section>
+
+    <!-- 朋友圈（每日凌晨 00:00 自动汇总发布，仿微信朋友圈样式） -->
+    <section class="pyq-view hidden" id="pyq-view">
+      <div class="pyq-nav">
+        <button class="pyq-back-btn" id="pyq-back" aria-label="返回"></button>
+        <span class="pyq-nav-title">朋友圈</span>
+        <span class="pyq-nav-tag">🌙 每日自动更新</span>
+      </div>
+      <div class="pyq-scroll" id="pyq-scroll">
+        <div class="pyq-cover">
+          <div class="pyq-cover-deco">🌿</div>
+          <div class="pyq-cover-info">
+            <div class="pyq-cover-name" id="pyq-cover-name"></div>
+            <div class="pyq-cover-avatar" id="pyq-cover-avatar"></div>
+          </div>
+        </div>
+        <div class="pyq-feed" id="pyq-body"></div>
+        <div class="pyq-tip hidden" id="pyq-tip"></div>
+      </div>
+    </section>
+
+    <!-- 底部导航（个人页在最右） -->
+    <nav class="bottom-nav" id="bottom-nav">
+      <button class="tab tab-home active" data-page="home">
+        <span class="tab-ico" id="nav-ico-home"></span><span class="tab-tx">首页</span>
+      </button>
+      <button class="tab tab-stats" data-page="stats">
+        <span class="tab-ico" id="nav-ico-stats"></span><span class="tab-tx">统计</span>
+      </button>
+      <button class="tab tab-settings" data-page="settings">
+        <span class="tab-ico" id="nav-ico-settings"></span><span class="tab-tx">设置</span>
+      </button>
+      <button class="tab tab-profile" data-page="profile">
+        <span class="tab-ico" id="nav-ico-profile"></span><span class="tab-tx">个人页</span>
+      </button>
+    </nav>
+
+    <!-- 安装横幅 -->
+    <div class="install-banner hidden" id="install-banner">
+      <span class="ib-ico" id="ib-ico">🌿</span>
+      <div class="ib-tx"><b>添加到主屏幕</b><br><small>把「咖窝子」装进手机，随时记录</small></div>
+      <button class="ib-btn" id="ib-install">添加</button>
+      <button class="ib-close" id="ib-close" aria-label="关闭">×</button>
+    </div>
+  </div>
+
+  <!-- 通用弹窗 -->
+  <div class="modal-mask hidden" id="modal-mask">
+    <div class="modal" id="modal">
+      <div class="modal-head">
+        <div class="modal-title" id="modal-title">标题</div>
+        <button class="icon-btn" id="modal-close" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-foot" id="modal-foot"></div>
+    </div>
+  </div>
+
+  <!-- 日历弹窗 -->
+  <div class="modal-mask hidden" id="cal-mask">
+    <div class="modal modal-cal" id="calendar-modal">
+      <div class="modal-head">
+        <div class="cal-nav">
+          <button class="icon-btn" id="cal-prev" aria-label="上月"></button>
+          <div class="cal-month" id="cal-month">2026年9月</div>
+          <button class="icon-btn" id="cal-next" aria-label="下月"></button>
+        </div>
+        <button class="icon-btn" id="cal-close" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body" id="cal-body"></div>
+    </div>
+  </div>
+
+  <!-- 图片预览 -->
+  <div class="imgprev-mask hidden" id="imgprev-mask"><img id="imgprev" alt="预览" /></div>
+
+  <!-- Toast -->
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="./js/icons.js?v=18"></script>
+  <script src="./js/app.js?v=18"></script>
+  <noscript>
+    <div style="padding:24px;text-align:center;color:#4A4A4A;font-family:sans-serif">
+      「每日生活」需要启用 JavaScript 才能运行，请在浏览器设置中开启 JavaScript 后重新打开。
+    </div>
+  </noscript>
+</body>
+</html>
