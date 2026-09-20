@@ -1,9 +1,9 @@
 /* 日常记录 · Service Worker（离线缓存 + 可安装） */
 /* 网络优先策略：在线时始终拉取最新文件，避免旧缓存导致页面打不开；离线时回退到缓存，保证断网也能打开 */
-const CACHE = 'dailylife-v18';
+const CACHE = 'dailylife-v19';
 const ASSETS = [
-  './', './index.html', './manifest.json?v=18',
-  './css/styles.css?v=18', './js/icons.js?v=18', './js/app.js?v=18',
+  './', './index.html', './manifest.json?v=19',
+  './css/styles.css?v=19', './js/icons.js?v=19', './js/app.js?v=19',
   './icon-192.png', './icon-512.png', './apple-touch-icon.png'
 ];
 

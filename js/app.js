@@ -100,10 +100,93 @@ function findArr(cat,id){return state.records[cat].find(r=>r.id===id);}
    5) 存储完全不可用时，显示常驻红色提示条，不再静默丢数据。
 -------------------------------------------------------------------------- */
 let _db=null,_lsDead=false,_idbTimer=null,_idbJson=null,_rendering=false;
-function idbOpen(){return new Promise(res=>{try{if(!window.indexedDB)return res(null);const rq=indexedDB.open('dailylife_kv',1);rq.onupgradeneeded=()=>{try{rq.result.createObjectStore('kv');}catch(e){}};rq.onsuccess=()=>res(rq.result);rq.onerror=()=>res(null);}catch(e){res(null);}});}
+/* 数据库 v2：kv（状态备份） + imgs（图片库，图片 base64 只存这里，不占 localStorage） */
+function idbOpen(){return new Promise(res=>{try{
+  if(!window.indexedDB)return res(null);
+  const rq=indexedDB.open('dailylife_kv',2);
+  rq.onupgradeneeded=()=>{const db=rq.result;
+    if(!db.objectStoreNames.contains('kv'))db.createObjectStore('kv');
+    if(!db.objectStoreNames.contains('imgs'))db.createObjectStore('imgs');};
+  rq.onsuccess=()=>res(rq.result);rq.onerror=()=>res(null);}catch(e){res(null);}});}
 function idbSet(val){return new Promise(res=>{idbOpen().then(db=>{if(!db)return res(false);try{const tx=db.transaction('kv','readwrite');tx.objectStore('kv').put(val,KEY);tx.oncomplete=()=>res(true);tx.onerror=()=>res(false);}catch(e){res(false);}}).catch(()=>res(false));});}
 function idbGet(){return new Promise(res=>{idbOpen().then(db=>{if(!db)return res(null);try{const rq=db.transaction('kv').objectStore('kv').get(KEY);rq.onsuccess=()=>res(rq.result||null);rq.onerror=()=>res(null);}catch(e){res(null);}}).catch(()=>res(null));});}
+/* 图片库读写（base64 大字符串只进这里） */
+function idbImgSet(id,dataURL){return new Promise(res=>{idbOpen().then(db=>{if(!db)return res(false);try{const tx=db.transaction('imgs','readwrite');tx.objectStore('imgs').put(dataURL,id);tx.oncomplete=()=>res(true);tx.onerror=()=>res(false);}catch(e){res(false);}}).catch(()=>res(false));});}
+function idbImgGet(id){return new Promise(res=>{idbOpen().then(db=>{if(!db)return res(null);try{const rq=db.transaction('imgs').objectStore('imgs').get(id);rq.onsuccess=()=>res(rq.result||null);rq.onerror=()=>res(null);}catch(e){res(null);}}).catch(()=>res(null));});}
 function validState(d){return !!(d&&d.records&&d.profile&&d.settings);}
+/* ---------------- 图片外置层（根治「记录只保存前两天」） ----------------
+   旧做法把图片 base64 直接塞进 state 写 localStorage（上限约 5MB），几张照片就写满：
+   写满后新记录再也进不了 localStorage，而启动又优先读 localStorage（那份旧数据），
+   表现为「只保存前两天、后面全丢」。现在图片统一存 IndexedDB 大容量图片库，
+   state 只留短引用（img#i… / img#c…，c 表示已抠图 PNG），localStorage 体积恒定、永不爆。 */
+const IMGPREFIX='img#';
+const IMG_PLACEHOLDER='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+let _imgCache=new Map(),_imgRev=new Map(),_imgPending=new Set(),_imgRerenderT=null;
+function isImgRef(s){return typeof s==='string'&&s.startsWith(IMGPREFIX);}
+function imgSrc(s){
+  if(typeof s!=='string')return '';
+  if(!isImgRef(s))return s;                     /* 旧数据/小图仍是真实 dataURL，原样返回 */
+  const key=s.slice(IMGPREFIX.length),v=_imgCache.get(key);
+  if(v)return v;
+  if(!_imgPending.has(key)){
+    _imgPending.add(key);
+    idbImgGet(key).then(d=>{_imgPending.delete(key);if(d){_imgCache.set(key,d);scheduleImgRerender();}});
+  }
+  return IMG_PLACEHOLDER;                        /* 尚未读回：先占位，读回后自动重绘 */
+}
+function scheduleImgRerender(){clearTimeout(_imgRerenderT);_imgRerenderT=setTimeout(()=>{try{rerenderVisible();}catch(e){}},60);}
+/* 把 dataURL 存入图片库并返回短引用（内容去重；写入时立即进内存缓存，可马上显示） */
+function stashImg(d){
+  if(typeof d!=='string'||!d.startsWith('data:'))return d;
+  const revKey=d.length+'|'+d.slice(0,64)+'|'+d.slice(-64);
+  const hit=_imgRev.get(revKey);if(hit)return hit;
+  const id=(d.startsWith('data:image/png')?'c':'i')+uid();   /* c=抠图PNG（供 isCut 判断） */
+  const ref=IMGPREFIX+id;
+  _imgCache.set(id,d);_imgRev.set(revKey,ref);
+  idbImgSet(id,d);
+  return ref;
+}
+/* 把 state 里残留的大图（旧数据）全部外置到图片库，返回处理张数 */
+function migrateImgs(){
+  if(!state||!state.records)return 0;
+  let n=0;
+  const conv=a=>{if(!Array.isArray(a))return;for(let i=0;i<a.length;i++){if(typeof a[i]==='string'&&a[i].startsWith('data:')){a[i]=stashImg(a[i]);n++;}}};
+  RECORD_CATS.concat(['album']).forEach(c=>{(state.records[c]||[]).forEach(r=>{
+    conv(r.images);
+    if(typeof r.image==='string'&&r.image.startsWith('data:')){r.image=stashImg(r.image);n++;}
+  });});
+  if(state.profile&&typeof state.profile.avatar==='string'&&state.profile.avatar.startsWith('data:')){state.profile.avatar=stashImg(state.profile.avatar);n++;}
+  return n;
+}
+/* 图片库 → 内存缓存（渲染/导出前调用），完成后自动重绘 */
+function preloadImgs(){
+  const ids=[];
+  const collect=a=>{if(Array.isArray(a))a.forEach(s=>{if(isImgRef(s))ids.push(s.slice(IMGPREFIX.length));});};
+  RECORD_CATS.concat(['album']).forEach(c=>{(state.records[c]||[]).forEach(r=>{collect(r.images);if(isImgRef(r.image))ids.push(r.image.slice(IMGPREFIX.length));});});
+  if(state.profile&&isImgRef(state.profile.avatar))ids.push(state.profile.avatar.slice(IMGPREFIX.length));
+  const uniq=[...new Set(ids)].filter(id=>!_imgCache.has(id));
+  if(!uniq.length)return Promise.resolve();
+  return Promise.all(uniq.map(id=>idbImgGet(id).then(d=>{if(d)_imgCache.set(id,d);}))).then(()=>{scheduleImgRerender();});
+}
+/* 按 id 去重合并记录：把 from 里有、to 里没有的记录并入 to（用于抢救 IndexedDB 里"看不到"的数据） */
+function mergeRecords(from,to){
+  let n=0;
+  RECORD_CATS.concat(['album']).forEach(c=>{
+    const have=new Set((to.records[c]||[]).map(r=>r.id));
+    (from.records[c]||[]).forEach(r=>{if(!have.has(r.id)){to.records[c].push(r);n++;}});
+  });
+  return n;
+}
+/* 统一刷新当前可见视图（图片异步读回后也用它重绘） */
+function rerenderVisible(){
+  try{
+    if($('#view-home')&&!$('#view-home').classList.contains('hidden'))renderHome();
+    if($('#view-profile')&&!$('#view-profile').classList.contains('hidden'))renderProfile();
+    if($('#view-stats')&&!$('#view-stats').classList.contains('hidden'))renderStats();
+    if($('#detail-view')&&!$('#detail-view').classList.contains('hidden'))refreshDetail();
+    if($('#pyq-view')&&!$('#pyq-view').classList.contains('hidden'))renderPyqList();
+  }catch(e){}
+}
 /* 常驻红色提示条：存储不可用/受限时提醒用户，而不是静默丢数据 */
 function storageBanner(msg){
   try{
@@ -195,11 +278,19 @@ async function loadBackup(){
 function save(){
   if(!state)return;
   state._sv=Date.now();
+  /* 防爆①：序列化后体积偏大（还内嵌着大图）→ 先把图片外置到图片库，localStorage 只留轻量引用 */
   let json;
   try{json=JSON.stringify(state);}catch(e){return;}
+  if(json.length>6e5){const n=migrateImgs();if(n){try{json=JSON.stringify(state);}catch(e){return;}}}
   let lsFail=false;
   if(!_lsDead){
-    try{localStorage.setItem(KEY,json);}catch(e){_lsDead=true;lsFail=true;}
+    try{localStorage.setItem(KEY,json);}catch(e){lsFail=true;}
+    if(lsFail){
+      /* 防爆②：写满/受限 → 再把漏网的大图外置一次，然后重写；仍失败才判定 localStorage 不可用 */
+      const n=migrateImgs();
+      if(n){try{const j2=JSON.stringify(state);localStorage.setItem(KEY,j2);json=j2;lsFail=false;}catch(e){_lsDead=true;}}
+      else _lsDead=true;
+    }
   }else lsFail=true;
   if(lsFail){
     /* localStorage 不可用/超限：立即改存 IndexedDB，并给出醒目标识 */
@@ -307,7 +398,7 @@ function compressImage(file){
 }
 
 /* ---------------- 照片抠图贴纸：抠出主体 + 白描边 ---------------- */
-const isCut=s=>typeof s==='string'&&s.startsWith('data:image/png'); // 抠图结果是透明PNG
+const isCut=s=>typeof s==='string'&&(s.startsWith('data:image/png')||s.startsWith(IMGPREFIX+'c')); // 抠图结果是透明PNG（引用里 c 前缀代表已抠图）
 function loadImgEl(dataUrl){return new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=rej;im.src=dataUrl;});}
 
 /* 第1层：边缘泛洪抠图（纯色/简单背景，瞬间完成） */
@@ -532,7 +623,7 @@ function renderHome(){
   const doneCount=RECORD_CATS.filter(c=>state.records[c].some(r=>r.date===today)).length;
   // 侧栏顶部个人资料卡
   const p=state.profile;
-  const avatarHTML=p.avatar?`<img src="${p.avatar}" alt="头像">`:'<span>🐱</span>';
+  const avatarHTML=p.avatar?`<img src="${imgSrc(p.avatar)}" alt="头像">`:'<span>🐱</span>';
   const profileCard=`<div class="side-profile" id="side-profile">
     <div class="sp-avatar">${avatarHTML}</div>
     <div class="sp-name">${esc(p.nickname||'小窝')}</div>
@@ -619,7 +710,7 @@ function renderDetailList(){
   $$('#detail-body .rec-item').forEach(el=>{
     el.querySelector('[data-act="edit"]').onclick=()=>openForm(c,el.dataset.id);
     el.querySelector('[data-act="del"]').onclick=()=>delRec(c,el.dataset.id);
-    el.querySelectorAll('.thumb-row img').forEach(im=>im.onclick=()=>previewImg(im.src));
+    el.querySelectorAll('.thumb-row img').forEach(im=>im.onclick=()=>previewImg(imgSrc(im.dataset.s||im.src)));
   });
 }
 function recItemHTML(c,r){
@@ -633,7 +724,7 @@ function recItemHTML(c,r){
   if(c==='sleep'){ico=getIcon('sleep');title='睡眠 '+r.duration+'h · '+r.quality+'★';sub=[r.sleepTime+'→'+r.wakeTime,r.nap?'午睡'+r.napDuration+'h':null].filter(Boolean);}
   if(c==='album'){ico='📸';title=r.note||'照片';sub=[r.date];}
   const imgs=(r.images||[]).concat(c==='consume'&&r.image?[r.image]:c==='sleep'&&r.image?[r.image]:c==='finance'&&r.image?[r.image]:[]).filter(Boolean);
-  if(imgs.length)thumbs=`<div class="thumb-row">${imgs.slice(0,4).map(s=>`<img class="doodle ${isCut(s)?'ct':''}" src="${s}" alt="">`).join('')}</div>`;
+  if(imgs.length)thumbs=`<div class="thumb-row">${imgs.slice(0,4).map(s=>`<img class="doodle ${isCut(s)?'ct':''}" src="${imgSrc(s)}" data-s="${s}" alt="">`).join('')}</div>`;
   return `<div class="rec-item" data-id="${r.id}" data-cat="${c}">
     <div class="ri-ico">${typeof ico==='string'&&ico.startsWith('<')?ico:esc(ico)}</div>
     <div class="ri-main"><div class="ri-title">${esc(title)}</div><div class="ri-sub">${sub.map(s=>`<span>${s}</span>`).join('')}</div>${thumbs}</div>
@@ -671,7 +762,7 @@ function renderCatCalendar(){
     const ph=catDayPhotos(c,d);
     let content='<div class="dcal-add">＋</div>';
     if(ph.length){
-      content=`<div class="dcal-phs">${ph.slice(0,3).map(s=>`<span class="dcal-ph ${isCut(s)?'ct':''}"><img src="${s}" alt=""></span>`).join('')}${ph.length>3?`<i class="dcal-more">+${ph.length-3}</i>`:''}</div>`;
+      content=`<div class="dcal-phs">${ph.slice(0,3).map(s=>`<span class="dcal-ph ${isCut(s)?'ct':''}"><img src="${imgSrc(s)}" data-s="${s}" alt=""></span>`).join('')}${ph.length>3?`<i class="dcal-more">+${ph.length-3}</i>`:''}</div>`;
     }else if(recs.length){
       content=`<div class="dcal-ico">${catDayEmoji(c,recs[0])}</div>`;
     }
@@ -706,7 +797,7 @@ function showCatDay(d){
   $$('#dcal-panel .rec-item').forEach(el=>{
     el.querySelector('[data-act="edit"]').onclick=()=>openForm(c,el.dataset.id);
     el.querySelector('[data-act="del"]').onclick=()=>delRec(c,el.dataset.id);
-    el.querySelectorAll('.thumb-row img').forEach(im=>im.onclick=()=>previewImg(im.src));
+    el.querySelectorAll('.thumb-row img').forEach(im=>im.onclick=()=>previewImg(imgSrc(im.dataset.s||im.src)));
   });
 }
 
@@ -741,7 +832,7 @@ function openForm(cat,id,date){
   $('#m-cancel').onclick=closeModal;
   $('#m-save').onclick=()=>saveForm(cat,id);
 }
-function imgGridHTML(){return `<div class="img-grid" id="f-imgs">${formImages.map((s,i)=>`<div class="img-cell ${isCut(s)?'ct':''}"><img src="${s}"><button class="x" data-i="${i}">×</button></div>`).join('')}<button type="button" class="img-add" id="f-img-add"><span class="img-add-ico">📷</span><span class="img-add-tx">拍照/相册</span></button></div>`;}
+function imgGridHTML(){return `<div class="img-grid" id="f-imgs">${formImages.map((s,i)=>`<div class="img-cell ${isCut(s)?'ct':''}"><img src="${imgSrc(s)}" data-s="${s}"><button class="x" data-i="${i}">×</button></div>`).join('')}<button type="button" class="img-add" id="f-img-add"><span class="img-add-ico">📷</span><span class="img-add-tx">拍照/相册</span></button></div>`;}
 /* 全局常驻文件框：所有文件选择共用（图片/头像/导入备份），避免"首次操作新建的 file input 失效、第二次才成功"的手机端问题 */
 let _pickCb=null,_pickRawCb=null;
 function initGlobalFile(){
@@ -771,13 +862,15 @@ function bindFormCommon(){
   const add=$('#f-img-add');if(add){
     add.onclick=()=>pickImage(async d=>{
       if(formImages.length>=3){toast('最多上传 3 张');return;}
-      /* 手机端优先：先立刻显示照片，再后台抠图，完成后原位替换成贴纸 */
-      const idx=formImages.push(d)-1;
+      /* 手机端优先：先把照片存入图片库并换成短引用（立刻可显示，localStorage 不再被图片撑爆），
+         再后台抠图，完成后原位替换成贴纸 */
+      const ref=stashImg(d);
+      const idx=formImages.push(ref)-1;
       $('#f-imgs').outerHTML=imgGridHTML();bindFormCommon();
       if(formCat==='diet'||formCat==='drink'||formCat==='sport'){
         try{
           const st=await cutoutImage(d);
-          if(st&&formImages[idx]===d){formImages[idx]=st;$('#f-imgs').outerHTML=imgGridHTML();bindFormCommon();}
+          if(st&&formImages[idx]===ref){formImages[idx]=stashImg(st);$('#f-imgs').outerHTML=imgGridHTML();bindFormCommon();}
         }catch(err){}
       }
     });
@@ -881,6 +974,7 @@ function pick(sel){const el=$(sel);el.onclick=e=>{const o=e.target.closest('.ico
 function val(id){const el=$('#'+id);return el?el.value.trim():'';}
 
 function saveForm(cat,id){
+  formImages=formImages.map(stashImg); /* 兜底：确保表单图片都已外置成短引用 */
   const date=formDate;const time=nowHM();
   let rec={id:id||uid(),date,time};
   if(cat==='diet'){rec.meal=sel('#f-meal');rec.name=val('f-name');if(!rec.name){toast('请填写食物名称');return;}
@@ -936,10 +1030,10 @@ function renderAlbum(){
   const groups={};imgs.forEach(i=>{(groups[i.date]=groups[i.date]||[]).push(i);});
   let html='';
   Object.keys(groups).sort((a,b)=>b.localeCompare(a)).forEach(d=>{
-    html+=`<div class="date-group">${d} · ${weekday(d)}（${groups[d].length}张）</div><div class="thumb-row" style="gap:6px">${groups[d].map(g=>`<img src="${g.src}" style="width:80px;height:80px" onclick="window.__prev('${g.src}')">`).join('')}</div>`;
+    html+=`<div class="date-group">${d} · ${weekday(d)}（${groups[d].length}张）</div><div class="thumb-row" style="gap:6px">${groups[d].map(g=>`<img src="${imgSrc(g.src)}" data-s="${g.src}" style="width:80px;height:80px" onclick="window.__prev(this.dataset.s)">`).join('')}</div>`;
   });
   $('#detail-body').innerHTML=html;
-  window.__prev=previewImg;
+  window.__prev=s=>previewImg(imgSrc(s));
 }
 
 /* ===========================================================
@@ -964,7 +1058,7 @@ function renderProfile(){
     {c:'consume',n:'消费',i:'consume',rows:`¥${wcons.reduce((a,r)=>a+(+r.amount||0),0)}`},
     {c:'sleep',n:'睡眠',i:'sleep',rows:wsleep.length?(wsleep.reduce((a,r)=>a+(+r.duration||0),0)/wsleep.length).toFixed(1)+'h':'—'},
   ];
-  const av=p.avatar?`<img src="${p.avatar}" alt="">`:getIcon('profile');
+  const av=p.avatar?`<img src="${imgSrc(p.avatar)}" alt="">`:getIcon('profile');
   $('#view-profile').innerHTML=`
     <div class="profile-head fade-in">
       <div class="avatar" id="p-avatar">${av}</div>
@@ -993,7 +1087,7 @@ function renderProfile(){
   $('#pyq-entry').onclick=openPyq;
 }
 function changeAvatar(){
-  pickImage(async d=>{state.profile.avatar=d;save();renderProfile();toast('头像已更新');});
+  pickImage(async d=>{state.profile.avatar=stashImg(d);save();renderProfile();toast('头像已更新');});
 }
 function editName(){
   openModal('修改昵称',`<div class="field"><input class="input" id="f-v" value="${esc(state.profile.nickname)}" placeholder="昵称"></div>`,`<button class="btn-ghost" id="m-cancel">取消</button><button class="btn-primary" id="m-ok">保存</button>`);
@@ -1042,7 +1136,7 @@ function statsCatBody(){
     const bySweet=SWEET.map((s,i)=>({label:s,value:recs.filter(r=>+r.sweet===i).length,color:PA(i)}));
     window.__catDonut=bySweet;
     const ph=[];recs.forEach(r=>((r.images&&r.images.length)?r.images:(r.image?[r.image]:[])).forEach(s=>ph.push(s)));
-    const wall=ph.length?`<div class="fall-wall">${ph.map((s,i)=>`<img class="fall-photo${isCut(s)?' ct':' doodle'}" src="${s}" style="animation-delay:${(Math.min(i,24)*0.12).toFixed(2)}s" onclick="window.__prev('${s}')">`).join('')}</div>`:`<div class="empty">${lb}还没有上传饮料照片 📷</div>`;
+    const wall=ph.length?`<div class="fall-wall">${ph.map((s,i)=>`<img class="fall-photo${isCut(s)?' ct':' doodle'}" src="${imgSrc(s)}" data-s="${s}" style="animation-delay:${(Math.min(i,24)*0.12).toFixed(2)}s" onclick="window.__prev(this.dataset.s)">`).join('')}</div>`:`<div class="empty">${lb}还没有上传饮料照片 📷</div>`;
     body=`<div class="kpi-row"><div class="kpi"><b>${recs.length}</b><span>${lb}喝了几杯</span></div><div class="kpi"><b>¥${total}</b><span>${lb}饮料花费</span></div><div class="kpi"><b>${recs.length?'¥'+(total/recs.length).toFixed(1):'—'}</b><span>平均每杯</span></div></div>
     <div class="chart-card"><h4>${lb}饮料照片墙 📸</h4>${wall}</div>
     <div class="chart-card"><h4>甜度偏好</h4><canvas id="c-cat"></canvas><div class="legend">${bySweet.map(c=>`<span><i style="background:${c.color}"></i>${c.label} ${c.value}</span>`).join('')}</div></div>`;
@@ -1073,7 +1167,7 @@ function statsCatBody(){
     body=`<div class="kpi-row"><div class="kpi"><b>¥${total}</b><span>${lb}总消费</span></div><div class="kpi"><b style="color:var(--warn)">${imp}次</b><span>冲动消费</span></div></div>
     <div class="chart-card"><h4>消费类型占比</h4><canvas id="c-cat"></canvas><div class="legend">${byType.map(c=>`<span><i style="background:${c.color}"></i>${c.label} ¥${c.value}</span>`).join('')}</div></div>`;
   }
-  window.__prev=previewImg;
+  window.__prev=s=>previewImg(imgSrc(s));
   return body||'<div class="empty">暂无数据</div>';
 }
 /* 旧照片后台补抠图：饮料照片墙要求统一为「抠主体+白描边」贴纸；非贴纸照片逐张尝试抠图并原位升级 */
@@ -1087,11 +1181,13 @@ async function retroCutPhotos(){
       const imgs=(r.images&&r.images.length)?r.images:(r.image?[r.image]:[]);
       for(let i=0;i<imgs.length;i++){
         const s=imgs[i];
-        if(typeof s!=='string'||!s.startsWith('data:image/')||isCut(s)||_retroCutTried.has(s))continue;
+        if(typeof s!=='string'||isCut(s)||_retroCutTried.has(s))continue;   /* 已抠图（引用 c 前缀）跳过 */
+        const real=imgSrc(s);                          /* 引用 → 真实 dataURL */
+        if(!real.startsWith('data:image/'))continue;
         _retroCutTried.add(s);
         try{
-          const st=await cutoutImage(s);
-          if(st&&imgs[i]===s){imgs[i]=st;if(r.images)r.images=imgs;else r.image=imgs[0];save();
+          const st=await cutoutImage(real);
+          if(st&&imgs[i]===s){imgs[i]=stashImg(st);if(r.images)r.images=imgs;else r.image=imgs[0];save();
             if(curStatsCat==='drink'&&!$('#view-stats').classList.contains('hidden'))renderStats();}
         }catch(e){}
       }
@@ -1192,8 +1288,8 @@ function statsYear(){
   // 相册时间轴
   const imgs=allImages().filter(i=>i.date.startsWith(y+'-'));
   const groups={};imgs.forEach(i=>{(groups[i.date]=groups[i.date]||[]).push(i);});
-  let album='';Object.keys(groups).sort((a,b)=>b.localeCompare(a)).slice(0,40).forEach(d=>{album+=`<div class="date-group">${d}</div><div class="thumb-row">${groups[d].map(g=>`<img src="${g.src}" style="width:64px;height:64px" onclick="window.__prev('${g.src}')">`).join('')}</div>`;});
-  window.__prev=previewImg;
+  let album='';Object.keys(groups).sort((a,b)=>b.localeCompare(a)).slice(0,40).forEach(d=>{album+=`<div class="date-group">${d}</div><div class="thumb-row">${groups[d].map(g=>`<img src="${imgSrc(g.src)}" data-s="${g.src}" style="width:64px;height:64px" onclick="window.__prev(this.dataset.s)">`).join('')}</div>`;});
+  window.__prev=s=>previewImg(imgSrc(s));
   return `
    <div class="section-title"><span class="st-ico">${getIcon('star')}</span>${y} 年度回忆</div>
    <div class="kpi-row">
@@ -1267,7 +1363,7 @@ function renderSettings(){
     </div>
     <div class="set-list">
       ${(!window.matchMedia('(display-mode: standalone)').matches&&!window.navigator.standalone)?`<div class="set-row" id="s-install"><span class="sr-ico">📥</span><span class="sr-tx">安装应用（桌面/主屏幕）</span><span class="sr-val">离线可用</span><span class="sr-arrow">${getIcon('arrow')}</span></div>`:''}
-      <div class="set-row" id="s-about"><span class="sr-ico">${getIcon('info')}</span><span class="sr-tx">关于 日常记录</span><span class="sr-val">v1.8</span><span class="sr-arrow">${getIcon('arrow')}</span></div>
+      <div class="set-row" id="s-about"><span class="sr-ico">${getIcon('info')}</span><span class="sr-tx">关于 日常记录</span><span class="sr-val">v1.9</span><span class="sr-arrow">${getIcon('arrow')}</span></div>
     </div>`;
   $('#s-avatar').onclick=changeAvatar;
   refreshStorageStatus(); /* 若启动自检已完成，立即显示真实存储状态 */
@@ -1284,7 +1380,7 @@ function renderSettings(){
   $('#s-export').onclick=exportData;
   $('#s-import').onclick=importData;
   $('#s-clear').onclick=()=>openConfirm('确定清空全部数据？此操作不可恢复',()=>{RECORD_CATS.forEach(c=>state.records[c]=[]);save();toast('已清空全部数据');if(!$('#view-home').classList.contains('hidden'))renderHome();if(!$('#view-profile').classList.contains('hidden'))renderProfile();if(!$('#view-stats').classList.contains('hidden'))renderStats();});
-  $('#s-about').onclick=()=>{openModal('关于 每日生活',`<div style="text-align:center;padding:10px"><div style="font-size:40px">🌿</div><p style="font-weight:800;font-size:17px;color:var(--accent)">每日生活 Daily Life</p><p style="color:var(--soft);font-size:13px">一款治愈系日常记录 App<br>记录饮食·饮料·运动·心情·消费·理财·睡眠<br>数据完全保存在本地，不上传服务器<br>版本 v1.8 · Web PWA</p></div>`,`<button class="btn-primary" id="m-ok">知道了</button>`);$('#m-ok').onclick=closeModal;};
+  $('#s-about').onclick=()=>{openModal('关于 每日生活',`<div style="text-align:center;padding:10px"><div style="font-size:40px">🌿</div><p style="font-weight:800;font-size:17px;color:var(--accent)">每日生活 Daily Life</p><p style="color:var(--soft);font-size:13px">一款治愈系日常记录 App<br>记录饮食·饮料·运动·心情·消费·理财·睡眠<br>数据完全保存在本地，不上传服务器<br>版本 v1.9 · Web PWA</p></div>`,`<button class="btn-primary" id="m-ok">知道了</button>`);$('#m-ok').onclick=closeModal;};
 }
 function applyTheme(){document.body.classList.toggle('theme-green',state.settings.theme==='green');}
 function promptNum(title,def,cb){openModal(title,`<div class="field"><input class="input" id="f-v" type="number" value="${def}" placeholder="数字"></div>`,`<button class="btn-ghost" id="m-cancel">取消</button><button class="btn-primary" id="m-ok">确定</button>`);$('#m-cancel').onclick=closeModal;$('#m-ok').onclick=()=>{cb(val('f-v'));closeModal();};}
@@ -1301,7 +1397,16 @@ function exportData(){
     <button class="btn-ghost" id="ex-csv">📊 导出 CSV（文字+数字，图片以链接占位）</button>
     </div>`,`<button class="btn-ghost" id="m-cancel">取消</button>`);
   $('#m-cancel').onclick=closeModal;
-  $('#ex-json').onclick=()=>{const blob=new Blob([JSON.stringify(state)],{type:'application/json'});downloadBlob(blob,'每日生活-备份-'+todayStr()+'.json');closeModal();toast('已导出 JSON');};
+  $('#ex-json').onclick=async()=>{
+    closeModal();toast('正在打包图片…');
+    try{
+      await preloadImgs();                              /* 确保图片都已读回内存 */
+      const full=expandedState();                       /* 引用→真实图片：备份文件自带图片，换设备导入不丢图 */
+      const blob=new Blob([JSON.stringify(full)],{type:'application/json'});
+      downloadBlob(blob,'咖窝子-备份-'+todayStr()+'.json');
+      toast('已导出 JSON（含图片）');
+    }catch(e){toast('导出失败，请重试');}
+  };
   $('#ex-csv').onclick=()=>{downloadBlob(new Blob([buildCSV()],{type:'text/csv;charset=utf-8'}),'每日生活-数据-'+todayStr()+'.csv');closeModal();toast('已导出 CSV');};
 }
 function buildCSV(){
@@ -1316,6 +1421,14 @@ function buildCSV(){
   state.records.sleep.forEach(r=>push('睡眠',r,r.duration+'h '+r.quality+'★',r.sleepTime+'→'+r.wakeTime));
   return '﻿'+lines.join('\n');
 }
+/* 导出用：把图片引用还原成真实图片（换设备/清缓存后导入仍完整） */
+function expandedState(){
+  const deep=JSON.parse(JSON.stringify(state));
+  const conv=a=>{if(!Array.isArray(a))return;for(let i=0;i<a.length;i++){a[i]=imgSrc(a[i]);}};
+  RECORD_CATS.concat(['album']).forEach(c=>{(deep.records[c]||[]).forEach(r=>{conv(r.images);if(isImgRef(r.image))r.image=imgSrc(r.image);});});
+  if(deep.profile&&isImgRef(deep.profile.avatar))deep.profile.avatar=imgSrc(deep.profile.avatar);
+  return deep;
+}
 function importData(){
   pickJson(txt=>{
     try{
@@ -1324,7 +1437,8 @@ function importData(){
         /* 与默认结构合并，防止旧备份缺少新字段导致下次启动被判定为损坏数据 */
         const b=demoData();
         state={...b,...d,records:Object.assign({},b.records,d.records)};
-        save();applyTheme();toast('导入成功');showTab('home');
+        migrateImgs();   /* 备份里的图片先外置进图片库，避免又把 localStorage 撑爆 */
+        save();applyTheme();showTab('home');rerenderVisible();toast('导入成功');
       }else toast('文件格式不正确');
     }catch(err){toast('解析失败');}
   });
@@ -1376,7 +1490,7 @@ function renderCalendar(){
     const rep=dayRepresentative(d);const isT=d===todayStr();
     let content='';
     if(rep){
-      if(rep.type==='img')content=`<div class="cal-img"><img class="doodle" src="${rep.src}" alt=""></div>`;
+      if(rep.type==='img')content=`<div class="cal-img"><img class="doodle" src="${imgSrc(rep.src)}" data-s="${rep.src}" alt=""></div>`;
       else content=`<div class="cal-ico">${getIcon(CATS.find(c=>c.key===rep.cat).icon)}</div>`;
     }else content=`<div class="cal-ico" style="opacity:.25">${getIcon('calendar')}</div>`;
     return `<div class="cal-cell ${isT?'today':''}" data-d="${d}"><div class="cal-day">${+d.slice(-2)}</div>${content}</div>`;
@@ -1404,7 +1518,7 @@ function showCalDay(d){
   if(!any)html+=`<div class="empty">这一天还没有记录，点击上方分类图标添加吧～</div>`;
   $('#cal-detail').innerHTML=html;
   $$('#cal-detail .ac-btn').forEach(b=>b.onclick=()=>{openFormForDate(b.dataset.cat,b.dataset.date);});
-  $$('#cal-detail .rec-item').forEach(el=>{el.querySelector('[data-act="edit"]').onclick=()=>{closeCalendar();openForm(el.dataset.cat,el.dataset.id);};el.querySelectorAll('.thumb-row img').forEach(im=>im.onclick=()=>previewImg(im.src));});
+  $$('#cal-detail .rec-item').forEach(el=>{el.querySelector('[data-act="edit"]').onclick=()=>{closeCalendar();openForm(el.dataset.cat,el.dataset.id);};el.querySelectorAll('.thumb-row img').forEach(im=>im.onclick=()=>previewImg(imgSrc(im.dataset.s||im.src)));});
 }
 function openFormForDate(cat,date){
   closeCalendar();
@@ -1507,7 +1621,7 @@ function openPyq(){
   $('#pyq-back').innerHTML=getIcon('back');
   const p=state.profile;
   $('#pyq-cover-name').textContent=p.nickname||'小窝';
-  $('#pyq-cover-avatar').innerHTML=p.avatar?`<img src="${p.avatar}" alt="">`:'<span>🐱</span>';
+  $('#pyq-cover-avatar').innerHTML=p.avatar?`<img src="${imgSrc(p.avatar)}" alt="">`:'<span>🐱</span>';
   renderPyqList();
   $('#pyq-view').classList.remove('hidden');
   $('#pyq-scroll').scrollTop=0;
@@ -1524,8 +1638,8 @@ function pyqMetaLine(d){
 function pyqImgsHTML(imgs){
   if(!imgs.length)return '';
   const list=imgs.slice(0,9);
-  if(list.length===1)return `<div class="pyq-imgs single">${list.map(s=>`<img class="${isCut(s)?'ct':''}" src="${s}" alt="" loading="lazy">`).join('')}</div>`;
-  return `<div class="pyq-imgs">${list.map(s=>`<img class="${isCut(s)?'ct':''}" src="${s}" alt="" loading="lazy">`).join('')}</div>`;
+  if(list.length===1)return `<div class="pyq-imgs single">${list.map(s=>`<img class="${isCut(s)?'ct':''}" src="${imgSrc(s)}" data-s="${s}" alt="" loading="lazy">`).join('')}</div>`;
+  return `<div class="pyq-imgs">${list.map(s=>`<img class="${isCut(s)?'ct':''}" src="${imgSrc(s)}" data-s="${s}" alt="" loading="lazy">`).join('')}</div>`;
 }
 function renderPyqList(){
   ensurePyq();
@@ -1538,7 +1652,7 @@ function renderPyqList(){
     return;
   }
   tip.classList.add('hidden');
-  const av=p.avatar?`<img src="${p.avatar}" alt="">`:'<span>🐱</span>';
+  const av=p.avatar?`<img src="${imgSrc(p.avatar)}" alt="">`:'<span>🐱</span>';
   body.innerHTML=ms.map(m=>{
     const cap=buildPyqCaption(m.date);
     const imgs=dayImagesOf(m.date);
@@ -1552,7 +1666,7 @@ function renderPyqList(){
       </div>
     </article>`;
   }).join('');
-  $$('#pyq-body .pyq-imgs img').forEach(im=>im.onclick=()=>previewImg(im.src));
+  $$('#pyq-body .pyq-imgs img').forEach(im=>im.onclick=()=>previewImg(imgSrc(im.dataset.s||im.src)));
 }
 /* 凌晨定时：00:00:05 后自动把刚结束的一天发布到朋友圈 */
 function schedulePyq(){
@@ -1592,7 +1706,7 @@ function initPWA(){
   },2500);
   if('serviceWorker' in navigator){
     window.addEventListener('load',()=>{
-      navigator.serviceWorker.register('./service-worker.js?v=18',{updateViaCache:'none'}).then(reg=>{
+      navigator.serviceWorker.register('./service-worker.js?v=19',{updateViaCache:'none'}).then(reg=>{
         // 页面加载时主动检查 SW 更新（updateViaCache:none 保证 sw.js 本身不走 HTTP 缓存）
         reg.update().catch(()=>{});
         setInterval(()=>reg.update().catch(()=>{}),15*60*1000);
@@ -1623,15 +1737,7 @@ function init(){
      2) localStorage 缺失/损坏（如系统/PWA 清掉了本地存储）→ 先以全新空数据立即渲染，
         随后后台从 IndexedDB 自动找回历史备份并刷新界面，不阻塞、不丢数据；
      3) 所有操作经 save() 双写 localStorage + IndexedDB。 */
-  const rerenderVisible=()=>{
-    try{
-      if(!$('#view-home').classList.contains('hidden'))renderHome();
-      if(!$('#view-profile').classList.contains('hidden'))renderProfile();
-      if(!$('#view-stats').classList.contains('hidden'))renderStats();
-      if(!$('#detail-view').classList.contains('hidden'))refreshDetail();
-      if(!$('#pyq-view').classList.contains('hidden'))renderPyqList();
-    }catch(e){}
-  };
+  /* 统一刷新函数已提升到模块级（图片异步读回后也靠它重绘） */
   const adopt=(s)=>{
     state=s;
     applyTheme();
@@ -1676,22 +1782,36 @@ function init(){
     else if(hh.startsWith('d-')){setTimeout(()=>{const[cat,ds]=hh.slice(2).split('@');openDetail(cat);if(ds){dSel=ds;renderCatCalendar();}},150);}
     initPWA();
   };
-  if(load()&&validState(state)){adopt(state);return;}
+  /* 启动后与 IndexedDB 备份对齐（关键修复）：
+     旧版本把图片塞进 localStorage，写满后新记录只能进 IndexedDB，启动却只读 localStorage，
+     于是"只保存前两天、之后全丢"。现在：① 老数据里的内嵌大图先搬进图片库（localStorage 瘦身）；
+     ② 若备份里的记录比本地多，按 id 合并补回（绝不覆盖现有数据），把"看不见"的记录救回来。 */
+  const tally=s=>RECORD_CATS.concat(['album']).reduce((a,c)=>a+((s.records[c]||[]).length),0);
+  const normalize=s=>{RECORD_CATS.concat(['album']).forEach(c=>{if(!s.records[c])s.records[c]=[];});if(!s.moments)s.moments=[];};
+  const syncFromBackup=(isFresh,freshRef,freshRecs)=>{
+    if(migrateImgs())save();     /* 内嵌大图外置：localStorage 体积骤降，之后再也不会写满 */
+    preloadImgs();
+    loadBackup().then(b=>{
+      if(!b||!validState(b))return;
+      if(tally(b)<=tally(state))return;                       /* 备份不比本地多，无需处理 */
+      if(isFresh&&state===freshRef&&JSON.stringify(state.records)===freshRecs){
+        /* 本地是"首次安装演示数据"、备份才是真实数据 → 整体采用备份 */
+        state=b;normalize(state);save();preloadImgs();rerenderVisible();
+        toast('已从自动备份恢复历史记录 🌿');
+      }else{
+        /* 本地已有数据但备份更全 → 合并补回缺失记录，不覆盖任何现有数据 */
+        const added=mergeRecords(b,state);
+        if(!added)return;
+        state._sv=Date.now();save();preloadImgs();rerenderVisible();
+        toast('已从自动备份找回 '+added+' 条记录 🌿');
+      }
+    });
+  };
+  if(load()&&validState(state)){adopt(state);syncFromBackup(false,null,null);return;}
   const fresh=firstRunData();
   const freshRecs=JSON.stringify(fresh.records);
   adopt(fresh); /* 秒开：空数据立即渲染 */
-  /* 后台自动找回：localStorage 被清空时从 IndexedDB 恢复历史数据 */
-  loadBackup().then(b=>{
-    if(!b||!validState(b))return;
-    if(state!==fresh)return;                                   /* 已切走 */
-    if(JSON.stringify(state.records)!==freshRecs)return; /* 用户已开始记录，绝不覆盖用户数据 */
-    state=b;
-    RECORD_CATS.concat(['album']).forEach(c=>{if(!state.records[c])state.records[c]=[];});
-    if(!state.moments)state.moments=[];
-    save();
-    rerenderVisible();
-    toast('已从自动备份恢复历史记录 🌿');
-  });
+  syncFromBackup(true,fresh,freshRecs);
 }
 window.previewImg=previewImg;
 window.closeModal=closeModal;
